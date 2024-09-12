@@ -1,0 +1,26 @@
+name: deep-impute
+channels:
+  - pytorch
+  - bioconda
+  - conda-forge
+  - anaconda
+dependencies:
+  - python=3.9
+  - tqdm
+  - snakemake
+  - seaborn=0.13.*
+  - scipy=1.13.*
+  - scikit-learn
+  - pytorch=1.10.*
+  - pandas
+  - numpy
+  - biopython 
+  - pip
+  - matplotlib
+  - jupyter
+  - ipykernel
+  - mkl==2024.0
+  - umap-learn
+  - pip:
+    - argparse==1.4.*
+

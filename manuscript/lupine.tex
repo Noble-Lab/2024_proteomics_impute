@@ -1,0 +1,415 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage[margin=1in]{geometry}
+\usepackage[parfill]{parskip}
+\usepackage{authblk} % Better formatting of affiliations.
+\usepackage{graphicx} % Allow graphics
+\usepackage{xcolor} % Allow colored text.
+\usepackage[sort&compress]{natbib} % Better bibliography formatting
+
+% For nice url formatting, including auto linebreaks
+\usepackage{xurl}
+
+% Makes nice looking tables
+\usepackage{tabularx}
+
+% Get periods in figure captions instead of colons
+\usepackage[labelsep=period]{caption}
+
+% Indicate FIXMEs with red text
+\newcommand{\fixme}[1]{{\color{red}{#1}}}
+
+% Get 'Abstract' in all caps. This is a bit hacky
+%\renewcommand\abstractname{\textsc{ABSTRACT}}
+
+% Enable superscript in-text citations
+\usepackage[superscript]{cite}
+
+\title{Imputation of cancer proteomics data with a deep model that learns from many datasets}
+
+\author[1]{Lincoln Harris}
+\author[1,2]{William S.\ Noble}
+
+\affil[1]{Department of Genome Sciences, University of Washington}
+\affil[2]{Paul G.\ Allen School of Computer Science and Engineering,
+  University of Washington}
+
+\date{\today}
+
+\begin{document}
+\sloppy
+
+\maketitle
+
+\begin{abstract}
+\noindent 
+Missing values are a major challenge in the analysis of mass spectrometry proteomics data. Missing values hinder reproducibility, decrease statistical power for identifying differentially expressed (DE) proteins and make it challenging to analyze low-abundance proteins. We present Lupine, a deep learning-based method for imputing, or estimating, missing values in tandem mass tag (TMT) proteomics data. Lupine is, to our knowledge, the first imputation method that is designed to learn jointly from many datasets, and we provide evidence that this approach leads to more accurate predictions. We validated Lupine by applying it to TMT data from $>$1,000 cancer patient samples spanning ten cancer types from the Clinical Proteomics Tumor Atlas Consortium (CPTAC). Lupine outperforms the state of the art for TMT imputation, identifies more DE proteins than other methods, corrects for TMT batch effects, and learns a meaningful representation of proteins and patient samples. Lupine is implemented as an open source Python package.
+\end{abstract}
+
+\section{Introduction}
+
+In spite of significant advances in instrument technology and sample preparation, missingness remains a challenge in quantitative mass spectrometry (MS) proteomics \cite{Bramer:review, Webb-Robertson:review}. ``Missingness'' refers to peptides that are present in the analyte but for various technical reasons including co-elution, electrospray competition and inability to confidently assign peptide spectrum matches, do not have an associated quantitative value \cite{Bramer:review, Webb-Robertson:review}. Missingness hinders reproducibility and reduces statistical power, making it difficult to compare across runs or experimental conditions. In addition, missingness can make it challenging to glean information from low-abundance peptides, which are important for disease etiology and progression in a number of contexts \cite{veenstra-2006, boschetti-2023, yu-2021}. 
+
+Here we focus on the specific challenge of missingness in tandem mass tag (TMT) proteomics. TMT data are collected using data-dependent acquisition, in which missingness can mainly be attributed to the fact that precursors are stochastically selected for fragmentation and quantification, leading to peptides that are quantified in one run but not the next. Missingness is especially pronounced for large-scale, multi-batch TMT experiments, in which the number of missing values scales logarithmically with the number of TMT batches or ``plexes'' \cite{multi-tmt}. Nevertheless, TMT offers unparalleled quantitative accuracy and has recently been used for large-scale studies of cancer and neurodegenerative disease \cite{seyfried-AD-TMT, pan-cancer, CPTAC-S051, savage-2024, CPTAC}. For example, TMT was used by the Clinical Proteomics Tumor Atlas Consortium (CPTAC) project \cite{CPTAC, pan-cancer} to analyze more than 1,000 clinical patient samples from ten types of cancer. 
+
+Empirically, missing values are not distributed entirely randomly but instead are typically correlated with the intensity of the peptide \cite{mengbo-2023}. In general, missing values may be either missing completely at random (MCAR) or missing not at random (MNAR) \cite{rubin-1976}. In the case of MCAR there is no relationship between underlying variables and the likelihood of an observation to be missing, whereas for MNAR there is. In MS proteomics, missing values tend to be MNAR because the likelihood that a peptide is missing depends on its intensity \cite{mengbo-2023}. Low-intensity peptides are more likely to be missing, although medium- or high-intensity peptides are occasionally missing as well \cite{mengbo-2023}. 
+
+Imputation is an analytical solution to missingness. ``Imputation'' refers to using statistical or machine learning procedures to estimate missing values based on the observed values alone. Imputation is routinely used to handle missingness in data from microarrays \cite{knn-impute}, single-cell transcriptomics \cite{ALRA, magic-scRNA}, epidemiology \cite{multi-impute-clinical}, and astronomy \cite{astro-impute1, astro-impute2}. 
+
+Many methods exist for proteomics imputation; however, each of them has significant limitations. For example, many of these methods have been borrowed from microarray analysis and were not specifically developed for MS. The most commonly used method is Gaussian random sampling, in which imputations are drawn from a Gaussian distribution centered about the low end of observed quantifications \cite{ms-impute-bench}. This method is employed by the popular Perseus tool \cite{Perseus} for MS data analysis. In spite of its popularity, this method works poorly \cite{ms-impute-bench}.
+
+DreamAI is the best performing current method for TMT imputation \cite{dream-ai}. DreamAI is an ensemble of the six winning methods from the NCI-CPTAC DREAM challenge (\url{https://www.synapse.org/Synapse: syn8228304/wiki/413428}), in which more than 20 teams competed to develop imputation methods for CPTAC TMT and isobaric tag for absolute and relative quantification (iTRAQ) data. Being an ensemble method, DreamAI includes high-performing methods such as MissForest \cite{MissForest}. The DreamAI ensembling strategy outperforms any one of the six individual methods in its ensemble \cite{dream-ai}. 
+
+% \fixme{Might be better to cite a review rather than individual articles – Bill.}
+
+Deep learning (DL) has revolutionized our ability to analyze biological data. Most famously, DL is being used to predict protein structures and to discover novel drug targets \cite{alphaFold3}. Within the field of proteomics, DL has been used for spectral library generation \cite{prosit}, retention time prediction \cite{wen-2020} and peptide de novo sequencing \cite{casanovo}. One general feature of most DL methods is that they benefit from training with as much data as possible. For example, DL-based de novo sequencing methods have been trained on 30 million peptide-spectrum matches from MassIVE-KB \cite{casanovo}.
+
+In spite of its impressive performance in other domains, DL has not yet gained widespread adoption for proteomics imputation. To our knowledge, there exists only one DL-based proteomics imputation method, called PIMMS, developed for label-free quantification (LFQ) \cite{webel-deep-impute}. Perhaps one explanation for the lack of adoption of DL is that existing strategies, including PIMMS, consider only a single dataset at a time and therefore do not benefit from very large training sets derived from multiple MS experiments. In this context underfitting is always a concern, especially when attempting to fit large DL models with many parameters. 
+
+Here we present Lupine, a DL-based proteomics imputation method that learns patterns of missingness from multiple datasets simultaneously. We trained Lupine on a joint quantifications matrix that consisted of proteins and MS samples from ten different TMT datasets. Lupine learns low-rank protein and sample embeddings, which are fed into a deep neural network (DNN) to generate predictions. Lupine incorporates an MNAR assumption into its training procedure, explicitly assuming that most missingness is left censored. Our experiments demonstrate that Lupine’s performance improves when trained on ten datasets as opposed to one. Lupine outperforms the current state of the art (DreamAI) in terms of test set accuracy and identifies more differentially expressed (DE) proteins than competing methods. Additionally, Lupine corrects for batch effects in TMT data and learns a meaningful latent representation of proteins and MS samples. 
+
+\begin{table}
+  \centering
+  \begin{tabular}{lrrr}
+    \hline
+    Cancer Type & \textit{N} Proteins & \textit{N} samples & Percent Missing (\%) \\
+    \hline
+    BRCA & 12,825 & 153 & 21.4 \\
+    CCRCC & 11,821 & 194 & 20.7 \\
+    COAD & 9,433 & 197 & 24.6 \\
+    GBM & 12,875 & 110 & 15.9 \\
+    HGSC & 10,967 & 103 & 21.5 \\
+    HNSCC & 12,158 & 188 & 19.3 \\
+    LSCC & 13,625 & 215 & 16.8 \\
+    LUAD & 13,206 & 221 & 18.4 \\
+    PDAC & 11,968 & 239 & 23.6 \\
+    UCEC & 12,505 & 135 & 18.9 \\
+    \hline
+  \end{tabular}
+  \caption{{\bf Description of the datasets used in this study.} 
+  All datasets were generated by the CPTAC Pan-Cancer Proteome project and processed with the pipeline described in the STAR Methods of Li et al\cite{pan-cancer}. 
+  Abbreviations: BRCA: breast cancer, CCRCC: clear cell renal cell carcinoma, COAD: colon adenocarcinoma, GBM: glioblastoma, HGSC: high-grade serous carcinoma, HNSCC: head and neck squamous cell carcinoma, LSCC: lung squamous cell carcinoma, LUAD: lung adenocarcinoma, PDAC: pancreatic ductal adenocarcinoma, UCEC: uterine corpus endometrial carcinoma.}
+    \label{tab:cptac-description}
+\end{table}
+
+\begin{figure}
+  \centering
+  \includegraphics[width=1.0\textwidth]{figures/lupine-schematic.pdf}
+  \caption{{\bf Lupine schematic and data partitioning procedure.} 
+  \textbf{A)} Model schematic. 
+  CPTAC datasets were combined into a single joint quantifications matrix to which Lupine was fit. Here the intensity of each color in the joint quantifications matrix corresponds to protein intensity.
+  \textbf{B)} Illustration of standard MCAR versus Lupine's MNAR data partitioning schemes. Lupine was trained entirely in the MNAR setting.}
+  \label{fig:model-schematic}
+\end{figure}
+
+\section{Experimental Procedures}
+
+\subsection{Joint quantifications matrix construction}
+\label{sec:joint-mat}
+
+We obtained TMT proteomics data\textemdash collected by CPTAC\textemdash through the Proteomics Data Commons web portal (\url{https://pdc.cancer.gov/pdc/cptac-pancancer}, file name: Proteome\_UMich\_GENCODE34\_v1.zip). Data were collected at five centers: Pacific Northwest National Laboratories, Vanderbilt University, Johns Hopkins University, Harvard Medical School and the Broad Institute. Samples were run on Thermo Fisher orbitrap instruments. Datasets were processed with the same analytical pipeline, the full details of which are provided in the STAR Methods of Li et al \cite{pan-cancer}. Briefly, this pipeline consisted of peptide search with MSFragger \cite{msfragger} against a GENCODEv34 database and post-processing with Philosopher \cite{philosopher} and TMT-Integrator \cite{msfragger}. TMT-10 or -11 plexes were normalized to a common reference channel then summarized at the protein level. 
+
+We constructed a joint quantifications matrix from CPTAC datasets. Rows in the joint quantifications matrix were proteins and columns were de-multiplexed TMT samples. When adding new MS samples (i.e., columns) to the matrix, if a protein was not quantified in the given sample, then the matrix entry was assigned a value of NaN (not a number) to indicate a missing value. We removed proteins quantified in fewer than 18 samples. Sample IDs containing the following key words were excluded from analysis: ``RefInt'', ``QC'', ``pool'', ``pooled'', ``reference'', ``NCI'', ``NX'', ``ref''. After filtering, this dataset consisted of 18,162 proteins and 1,755 samples. The overall missingness fraction was 48.7\%. 
+
+\subsection{Dataset partitioning and batch selection}
+\label{sec:partition}
+
+We used an MNAR data partitioning procedure to simulate the type of missingness most common to MS proteomics \cite{Bramer:review, Webb-Robertson:review, mengbo-2023}. Given our joint quantifications matrix $X$ with rows $i$ and columns $j$, we constructed a ``thresholds'' matrix $T_{i\times j}$. $T$ was populated with values sampled from a Gaussian distribution centered about the 25\textsuperscript{th} percentile of $X$ and with standard deviation ($\sigma$): $1.1\times X_{\sigma}$. For each $X_{ij}$, if the corresponding $T_{ij}$$>$$X_{ij}$, then $X_{ij}$ was assigned to the training set. Otherwise, a Bernoulli trial with success probability 0.61 was conducted. If the trial was successful, then $X_{ij}$ was assigned to the test set, otherwise, $X_{ij}$ was assigned to the training set. The Bernoulli success probability and Gaussian distribution mean and standard deviation were tuned such that 20\% of present matrix entries were assigned to the test set and the remaining 80\% were assigned to the training set. 
+
+We implemented a ``biased'' batch selection procedure during model training. To achieve this we conducted multiple rounds of the Bernoulli trial-based selection procedure described above, in which the training set was sampled with replacement to create a series of training batches. Low-intensity proteins were preferentially selected for training batches (Supplementary Figure \ref{fig:sup-partition}). The resulting distribution of training batches is left-skewed relative to the whole training set. This procedure was undertaken without looking at the test set. 
+
+\subsection{Model implementation}
+\label{sec:model}
+
+Lupine uses a DNN to learn a low-dimensional representation of proteins and MS samples (Figure \ref{fig:model-schematic}A). The protein and sample factor matrices, referred to as $W$ and $H$ respectively, were randomly initialized linear embedding layers. The shapes were as follows: $W$: (18,162, $p$) given $p$ protein factors and $H$: ($s$, 1,755) given $s$ sample factors. $W$ and $H$ contained no missing values. Selection of model hyperparameters $p$ and $s$ is described in the next section. 
+
+The Lupine training procedure was as follows. For each training batch, for each $Xtrain_{i,j}$, the corresponding protein ($W_{i}$) and sample ($H_{i}$) factors were concatenated and fed into a fully-connected multilayer perceptron (i.e., the DNN). This DNN consisted of a variable number of hidden layers and nodes per layer, with leaky ReLU activations (negative slope 0.1) after each layer. The DNN output a predicted value $Xpred_{i,j}$. The mean squared error (MSE) between $Xtrain_{i,j}$ and $Xpred_{i,j}$ was calculated. This procedure was repeated for every $Xtrain_{i,j}$ in the train batch, then model parameters $W$, $H$ and the DNN weights and biases were updated with backpropagation. The Adam optimizer was used, with a learning rate of 0.001. The training batch size was 128. 
+
+A validation set was used to determine model convergence. This validation set consisted of 10\% of matrix entries randomly selected (MCAR) from the training set. Training proceeded until one of two stopping criteria were triggered, as evaluated on the validation set: (1) The ratio of the difference between the best loss and the current loss (numerator) to the best loss (denominator) was calculated at the end of each epoch. If this ratio was less than a tolerance parameter (0.001) for 10 successive epochs, then training stopped. (2) A Wilcoxon rank sum test was conducted between two ``windows'' of validation set MSEs, window 1 being the previous five training epochs and window 2 being training epochs $n-10$ to $n-15$, where $n$ is the current epoch. If the one-sided Wilcoxon p-value comparing window 2 to window 1 was $<$0.05, then training stopped, indicating that validation error had stopped decreasing and had started to increase.
+
+Lupine was implemented in PyTorch v1.10.2 and was trained on a combination of nVidia GeForce GTX 1080, GeForce RTX 2080 and GeForce RTX 2080 Ti graphic processing units (GPUs). 
+
+\subsection{Benchmarking}
+\label{sec:benchmarking}
+
+The joint quantifications matrix was partitioned into 80\% train and 20\% test with an MNAR procedure, as described in Section \ref{sec:partition}. Proteins with fewer than 18 present values in the training set were removed from the training and test matrices. Lupine was fit to this training set.
+
+The training set was then divided into 10 subsets, each containing the MS samples for a single CPTAC cohort. For each cohort subset, proteins with fewer than three present values were removed from the matrix. DreamAI and Gaussian random sampling imputation were fit to each cohort subset. DreamAI was accessed via GitHub (\url{https://github.com/WangLab-MSSM/DreamAI}) and was run in R. Gaussian random sampling was implemented with custom python code replicating the Perseus procedure described here: \url{https://cox-labs.github.io/coxdocs/replacemissingfromgaussian.html}.
+
+Lupine is an ensemble model consisting of $n$ individual models trained with different values for the following hyperparameters: number of protein factors $p$, number of sample factors $s$, number of hidden layers and number of nodes per hidden layer. The search space for each hyperparameter was as follows: $p$ and $s$: $[64,128,256,512,1024]$, hidden layers: $[1,2,4]$, nodes per hidden layer: $[512,1024,2048]$. Of the 225 possible combinations of hyperparameters, a random selection of 42 was chosen. $n=42$ independent Lupine models were then fitted to the full training matrix. Each model used a different random seed and partitioned a different 10\% of training set $X_{ij}$s into its validation set. The predictions from these 42 models were then averaged to generate the final Lupine reconstructed matrix.
+
+To enable one-to-one performance comparisons, for each cohort, the Lupine reconstructed matrix was subset to include only the proteins contained by the DreamAI/Gaussian random sampling training matrix for that cohort. In this way we evaluated predictions on the same set of proteins and MS samples for all three models. We calculated the MSE between model predictions and the observed test set values for each cohort. 
+
+\subsection{Differential expression}
+\label{sec:differential-expression}
+
+We identified DE proteins between tumor and non-tumor samples within each CPTAC cohort after imputation with three methods. Lupine, DreamAI and Gaussian random sampling imputation were performed as described in the previous section. CPTAC metadata, containing sample type annotations, were obtained from the CPTAC data portal: \url{https://pdc.cancer.gov/pdc/}. For each cohort, proteins with $>$50\% missingness prior to imputation were excluded from DE analysis. 
+
+For each imputed protein, paired t-tests were conducted between protein quantifications from tumor and non-tumor samples. We also included a no imputation condition, in which missing values were ignored when conducting t-tests. P-values were adjusted with the Benjamini-Hochberg (BH) procedure \cite{bj-adjust}. Proteins with BH adjusted p-values $<$0.01 and log\textsubscript{2} fold changes $>$0.5 were considered DE. This same statistical procedure was used to identify DE proteins by CPTAC in Savage et al \cite{savage-2024}. The exception is that Savage et al.\ omitted the log\textsubscript{2} fold change criteria that we use here. 
+
+To identify enriched gene ontology (GO) terms, we used the PANTHER overrepresentation test (\url{https://pantherdb.org/tools/compareToRefList.jsp}). PANTHER19.0 was used. For each cohort, the set of up-regulated DE proteins was compared to a background list consisting of all 18,162 proteins in the joint quantifications matrix. The test type was Fisher’s exact and the annotation dataset was ``GO biological process complete.'' Representative enriched GO biological processes were chosen to populate Table \ref{tab:gene-set-enrichment}. This analysis was conducted after imputation with Lupine. 
+
+\subsection{Protein complex analysis}
+
+We compared within-complex to non-complex protein-protein correlations. The first step was to convert ENSEMBL v44 protein IDs to HGNC IDs within our joint quantifications matrix. We then divided our Lupine imputed joint quantifications matrix into 10 subsets according to CPTAC cohort. Proteins with initial (pre-imputation) missingness fractions $>$0.5 were removed from these matrices. Each cohort matrix was then subset to only tumor samples. We then searched HGNC IDs against the CORUM database (\url{https://mips.helmholtz-muenchen.de/corum/#download}, file name: humanComplexes.txt) of known human protein complexes \cite{corum} for each cohort. For each CORUM annotated complex, we computed the Spearman correlations between every pair of subunits in the complex. We then computed the same number of Spearman correlations for pairs of randomly selected proteins from the cohort matrix.
+
+\section{Results}
+
+\subsection{Overview of the Lupine model}
+
+% \fixme{Revise the flow here a bit. Consider making a separate subsection just describing the model and the dataset.}
+
+The Lupine model takes as input a partially completed protein-by-sample matrix of quantification values and trains a DNN to complete the matrix by filling in missing values. The Lupine model has two primary components. First, the model uses two linear embedding layers to learn low-dimensional representations of proteins and MS samples, referred to as protein and sample factors, respectively (Figure \ref{fig:model-schematic}A). Second, for each missing value, the corresponding protein and sample factors are concatenated and fed into a multilayer perceptron, which generates a protein intensity prediction. The mean squared error (MSE) between model predictions and training set observations is calculated, and the model uses backpropagation to update weights and biases. This process repeats until the model converges. Given the observation that ensembles of individual models, trained with different hyperparameters, often outperform single models \cite{goodfellow-2016}, Lupine is an ensemble of a user-specified (default: 10) number of individual models. 
+
+We hypothesized that, when trained on a large protein-by-samples matrix dervied from many different experiments, Lupine would outperform state-of-the-art methods for MS imputation. Accordingly, we constructed a ``joint'' quantifications matrix from ten CPTAC datasets (i.e., cohorts) corresponding to ten types of cancer. Rows in the matrix were proteins and columns were de-multiplexed TMT samples. We partitioned this matrix into train and test sets with an MNAR procedure described in Harris et al.\ \cite{ms-impute-bench} and Section \ref{sec:partition}. This resulted in a test set that was left-skewed relative to the training set (Figure \ref{fig:model-schematic}B). During model training, we used a ``biased'' batch selection procedure that preferentially selected matrix entries from the low end of the distribution of intensities for the training set (Supplementary Figure \ref{fig:sup-partition}). We reasoned that the model would train more effectively if the training set better resembled the test set.
+
+\subsection{Lupine outperforms the current state of the art for TMT imputation}
+
+For comparison, we benchmarked Lupine against DreamAI and Gaussian random sampling imputation. DreamAI is the current state of the art for TMT imputation \cite{dream-ai} while Gaussian random sampling is the most commonly used method \cite{ms-impute-bench}. MNAR missingness was simulated and missing values were predicted with each method. 
+
+This benchmarking experiment suggests that Lupine indeed outperforms DreamAI and Gaussian random sampling. For all 10 CPTAC cohorts, the test set reconstruction MSE was lower for Lupine than for either competing method (Figure \ref{fig:mse-compare}A). The residuals between imputed and observed test set values are shown for Lupine and DreamAI in Figure \ref{fig:mse-compare}B, for three representative cohorts. Points on the diagonal indicate identical predictions made by the two models. Points off the diagonal and centered about 0.0 on the y axis indicate proteins that were more accurately imputed by Lupine. We calculated the fraction of proteins that are more accurately predicted by Lupine than DreamAI. These fractions were 0.641 for CCRCC, 0.614 for HNSCC and 0.606 for LUAD. So as not to bias this analysis by proteins with very low prediction errors, this analysis was limited to proteins for which either method’s residual was $>$0.25. 
+
+Because individual Lupine models are relatively large, containing 4--11M parameters, we hypothesized that Lupine would perform best when applied to larger datasets. We therefore compared the model's performance when applied to each single cohort versus Lupine applied to the full collection of ten cohorts, using a fixed test set for each comparison.  As expected, we observe that Lupine performs better when trained on ten cohorts than on a single cohort (Figure \ref{fig:mse-compare}C, p=0.0035, paired t-test). On average, the MSE decreases by 34\%.  This result indicates that including additional MS samples in the training set improves performance even on the original test set samples. This result likely reflects the DL principle that more training data is generally better \cite{goodfellow-2016}\textemdash the full model may have less of a tendency to overfit. 
+
+We performed an ablation experiment to assess the effects of Lupine model ensembling. Models were fit with different random seeds and different numbers of protein factors, sample factors, hidden layers and nodes per hidden layer. We observe a 40\% performance gain from ensembling 10 models compared to a single model (Supplementary Figure \ref{fig:sup-ensembling}). The performance gain from ensembling 40 models relative to 10 is only 6\%. This finding informed our decision to set the default number of models to 10 in the Lupine python package. 
+
+% \fixme{Need to revise the next sentences to make the logic clearer, but this requires verifing the fixme in the previous sentence first.}
+
+It is worth bearing in mind that DreamAI is also an ensembling strategy that averages predictions from six individual imputation methods. Additionally, DreamAI uses a bootstrap aggregation (i.e., bagging) strategy that repeatedly samples the training data, fits models to each bootstrapped set and averages across sets. Thus is is not unreasonable to compare an ensemble of Lupine models to DreamAI. We attempted to fit DreamAI to the full joint quantifications matrix to include as a baseline in Supplementary Figure \ref{fig:sup-ensembling}. However, this proved computationally intractable, as fitting DreamAI to this very large matrix required $>$5 days of compute time (specifically, the MissForest step is extremely time consuming).
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.85\textwidth]{figures/performance-benchmarking-multipanel.pdf}
+  \caption{{\bf Benchmarking Lupine against state-of-the-art and commonly used proteomics imputation methods.} 
+  \textbf{A)} Test set MSE for Lupine versus Gaussian random sampling (left) and DreamAI (right) imputation, for ten CPTAC cohorts. 
+  \textbf{B)} Scatterplots of the residuals between model predictions and ground truth (i.e., test set) protein quantifications for Lupine and DreamAI, for three cohorts. The fraction of proteins for which Lupine predictions are more accurate than DreamAI are indicated. 
+  \textbf{C)} Test set MSE for Lupine models trained on the full joint quantifications matrix versus individual CPTAC cohorts.}
+  \label{fig:mse-compare}
+\end{figure} 
+
+\subsection{Lupine identifies additional differentially expressed proteins}
+
+The final goal of quantitative MS experiments is often the identification of proteins that are DE between experimental groups. This step is often hindered by excessive missingness, which can make it especially challenging to identify low-abundance DE proteins and can compromise statistical power, leading to identification of fewer than expected DE proteins. Imputation can help alleviate this problem. 
+
+To illustrate Lupine’s practical benefit, we compared the DE proteins identified between tumor and non-tumor samples in matrices that had been imputed with several different methods. Lupine was compared to DreamAI, Gaussian random sampling, and no imputation. For each imputed protein, paired t-tests were conducted between tumor and non-tumor samples; proteins with Benjamini-Hochberg adjusted p-values $<$0.01 and log\textsubscript{2} fold changes $>$0.5 were considered DE. For seven of eight cohorts, Lupine identifies the most up-regulated proteins, and for six of eight cohorts Lupine identifies the most down-regulated proteins (Figure \ref{fig:diff-expression}A). Two cohorts, BRCA and GBM, were excluded due to quality control issues with the matched non-tumor samples. These cohorts were also excluded from DE analysis in the original CPTAC publications \cite{krug-2020, savage-2024}. 
+
+The DE proteins identified after imputation with Lupine show good concordance with a recent CPTAC publication (Figure \ref{fig:diff-expression}C). Savage et al.\ used TMT proteomics data from CPTAC, with no imputation, to identify potential drug targets \cite{savage-2024}. Figure \ref{fig:diff-expression}C plots the percentage overlap between DE proteins annotated by Savage et al.\ and our study. For six of eight cohorts the overlap is greater than 90\%. This experiment serves as a sanity check, assuring us that expected DE proteins are still identified after imputation with Lupine. Note that the DE protein sets reported by Savage et al.\ fulfill two criteria: DE between tumor and non-tumor samples and critical for tumor survival and proliferation as determined by a CRISPR knockout screen in cancer cell lines. Figure \ref{fig:diff-expression}C does not include the set of DE proteins identified by only Lupine because of the possibility that these proteins were also identified as DE by Savage et al.\ but were not determined essential by their CRISPR screen.
+
+The top ten most DE proteins identified by Savage et al.\ are also highly DE in our analysis (Figure \ref{fig:diff-expression}B). Note that Savage et al.\ did not use log\textsubscript{2} fold change cutoffs when determining differential expression, which is why some of these top-10 proteins do not show up as DE in our analysis (proteins to the left of the dashed gray lines in Figure \ref{fig:diff-expression}B). Nevertheless, the p-values from both analyses are among the most significant. 
+
+The enriched GO terms for proteins up-regulated in tumor samples are generally related to cell growth and differentiation, DNA replication, and immune system regulation (Table \ref{tab:gene-set-enrichment}). Additional terms include inflammatory response, sugar synthesis, DNA repair, telomere lengthening and cell adhesion. 
+
+% \fixme{Add something about how these GO terms line up with other CPTAC publications.}
+
+Lupine identifies some up- and down-regulated proteins that are not identified by other imputation methods and that may be of biological interest. Lupine identifies on average four additional up-regulated and seven down-regulated proteins that are not identified by DreamAI or Gaussian random sampling imputation (Supplementary Table \ref{tab:lupine-unique-DE}). Most of these proteins are relatively low-intensity (Supplementary Figure \ref{fig:lupine-unique-DE-intensities}). These include the protease inhibitor SERPINB7 for LUAD, angiogenesis-associated growth factor VEGFC for PDAC, key developmental transcription factor SOX4 for LSCC, homeobox protein HOXB4 for UCEC, cell-cell adhesion glycoprotein CDH4 for CCRCC and Ras oncogene family member RAB40C in HNSCC. 
+
+However, we stress that the additional DE proteins identified by Lupine should be considered in the context of hypothesis generation. For experiments that are tolerant of false positives\textemdash for example, screening small molecules for therapeutic potential\textemdash Lupine’s ability to identify DE proteins may prove invaluable. But the gold standard for differential expression remains the directly observed quantifications from lower-throughput targeted assays. 
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.8\textwidth]{figures/differential-expression-multipanel.pdf}
+  \caption{{\bf Investigating differentially expressed proteins between tumor and non-tumor samples after imputation.} 
+  \textbf{A)} The number of up- and down-regulated proteins identified  within each CPTAC cohort after imputation with Lupine, DreamAI, Gaussian random sampling or no imputation. 
+  \textbf{B)} Volcano plots of DE proteins imputed with Lupine, for HNSCC and LUAD.
+  Plots have been annotated with the 10 most DE proteins identified by Savage et al \cite{savage-2024}.
+  \textbf{C)} The fraction of overlap between DE proteins identified by Savage et al.\ and those identified after imputation with Lupine.}
+  \label{fig:diff-expression}
+\end{figure} 
+
+% \fixme{Add the discussion of the Lupine-only sets thing to the figure legend – Bill.}
+
+\renewcommand{\arraystretch}{1.3}
+\begin{table}
+  \centering
+  \begin{tabular}{l|p{14cm}}
+    \hline
+    Cancer Type & Enriched Gene Sets \\
+    \hline
+    BRCA & Kinetochore assembly, Mitotic spindle assembly checkpoint signaling, Negative regulation of telomere maintenance via telomere lengthening \\
+    CCRCC & Positive regulation of antigen processing and presentation of peptide or polysaccharide antigen via MHC class II, Negative regulation of T cell co-stimulation, Regulation of tumor necrosis factor (ligand) superfamily member 11 production \\
+    COAD & Mitotic spindle organization, Regulation of mitotic cell cycle phase transition, Positive regulation of chronic inflammatory response \\
+    GBM & Sucrose biosynthetic process, Cell-cell adhesion in response to extracellular stimulus, Neutrophil aggregation \\
+    HGSC & Negative regulation of secretion of lysosomal enzymes, Negative regulation of myeloid progenitor cell differentiation, Mitochondrion migration along actin filament \\
+    HNSCC & Positive regulation of acute inflammatory response, Neutrophil activation, Regulation of transforming growth factor beta production \\
+    LSCC & Double-strand break repair via break-induced replication, Mitotic DNA replication initiation, Positive regulation of chromosome condensation \\
+    LUAD & Cell cycle process, Regulation of transcription by RNA polymerase II, Basophil chemotaxis \\
+    PDAC & Negative regulation of fibroblast growth factor receptor signaling pathway, Collagen fibril organization, Cell adhesion \\
+    UCEC & Polyprenol biosynthetic process, Epithelial cell differentiation, Negative regulation of tolerance induction \\
+    \hline
+  \end{tabular}
+  \caption{{\bf Enriched gene ontology (GO) terms among up-regulated proteins for comparisons of tumor versus non-tumor samples after imputation with Lupine.}}
+  \label{tab:gene-set-enrichment}
+\end{table}
+
+\subsection{Within-complex correlations are higher than non-complex correlations}
+
+Many proteins function within larger protein complexes and should thus exhibit correlated abundances. In principle, a poor imputation method could introduce noise and thus degrade these correlations.  Accordingly, we tested whether within-complex correlations are higher than non-complex correlations both before and after imputation with Lupine. We used protein complex annotations from the CORUM \cite{corum} database and limited this analysis to proteins with initial missingness fractions $<$50\% in the joint quantifications matrix. For each cohort, we calculated the Spearman correlations of intensities for all pairs of proteins within the same CORUM complex, and for the same number of pairs of randomly selected proteins. 
+
+Within-complex correlations are significantly higher than non-complex correlations both before and after Lupine imputation (Figure \ref{fig:complex-correlations}, paired t-test p-values $<$0.01). For Lupine imputed data, the mean within-complex correlation is 0.270, compared to 0.003 for non-complex. For unimputed data, the within-complex correlation is 0.284, compared to 0.001 for non-complex. It is reassuring that Lupine does not meaningfully reduce within-complex correlations and that non-complex correlations remain $\sim$0.0 after imputation. This result suggests that Lupine is not learning spurious correlations between proteins. 
+
+% It is worth noting that many of the complexes in CORUM are likely tissue type or developmental stage-dependent and represent transient rather than constitutive interactions. Thus it is unreasonable to expect the within-complex correlations in Figure \ref{fig:complex-correlations} to be extremely high. 
+
+\begin{figure}
+  \centering
+  \includegraphics[width=1.0\textwidth]{figures/protein-complex-correlations.pdf}
+  \caption{{\bf Within-complex versus non-complex protein-protein correlations before and after imputation.} 
+  Distributions of Spearman correlations of intensities of pairs of proteins potentially in the same complex (blue and orange) versus pairs of randomly selected proteins (green and purple), before and after imputation with Lupine.} 
+  \label{fig:complex-correlations}
+\end{figure} 
+
+\subsection{Lupine corrects for batch effects in TMT data}
+
+Batch effects represent a major challenge to the interpretation of TMT data \cite{multi-tmt}. Batch effect correction is often performed with methods like Combat \cite{combat} and surrogate variable analysis (SVA) \cite{sva}. While Lupine is not a batch correction method and is not intended to replace Combat or SVA, we have found that Lupine appears to automatically carry out some batch correction, even without having access to any batch structure annotations.
+
+For a single cohort, CCRCC, we imputed missing values with Lupine and column minimum (herein ``min'') impute, another naive but commonly used method \cite{ms-impute-bench}. Column min consists of replacing missing values with the lowest observed quantification for a given MS sample. We then performed dimensionality reduction with UMAP (\url{https://umap-learn.readthedocs.io/en/latest/}) and colored by sample type annotations and TMT batch IDs (Figure \ref{fig:batch-effects}). A priori, we did not expect column min to correct batch effects\textemdash we would have preferred to perform this analysis on unimputed quantifications, but UMAP requires complete matrices so we had to apply some imputation procedure. 
+
+Intriguingly, we observe that the Lupine imputed proteins cluster by sample type, whereas the column min imputed proteins cluster primarily by TMT batch (Figure \ref{fig:batch-effects}). The UMAP projection shown in the left panel of Figure \ref{fig:batch-effects} closely resembles the PCA analysis conducted by Clark et al.\ in CPTAC’s original description of the CCRCC data \cite{clark-2019}. Importantly, Clark et al.\ applied ComBat in addition to imputation, whereas we simply imputed with Lupine. The majority of the cohorts cluster by sample type following Lupine imputation (Supplementary Figure \ref{fig:sup-batch-effects}). Additionally, we see remarkable separation of CPTAC cohorts and tumor versus non-tumor samples when looking at the entire joint quantifications matrix following Lupine imputation (Supplementary Figure \ref{fig:sup-global-umap}). Thus, Lupine apparently learns to separate MS samples according to biological rather than technical signal. 
+
+We do not suggest that Lupine can serve as a replacement for batch effect correction algorithms like ComBat and SVA. For one thing, these methods differ from Lupine in that they are supervised\textemdash the identities of the batches are provided as input to the method. Lupine learns to separate technical from biological signal purely from the data themselves. For this reason we do not compare Lupine to ComBat or SVA. But the result in Figure \ref{fig:batch-effects} is interesting nonetheless and will be the subject of future exploration. Future versions of Lupine may be geared toward imputation and batch correction for single cell proteomics, a domain in which batch effects and missing values currently represent significant barriers to analysis \cite{gatto-2023, carr-scprot}. 
+
+\begin{figure}
+  \centering
+  \includegraphics[width=0.6\textwidth]{figures/batch-effects-CCRCC.pdf}
+  \caption{{\bf UMAP projections of protein intensities for a single CPTAC cohort following imputation with Lupine or column min.}  
+  Top panel is colored by sample type annotation (i.e., tumor versus non-tumor status); bottom panel is colored by TMT batch ID.}
+  \label{fig:batch-effects}
+\end{figure} 
+
+\subsection{Lupine learns a representation of proteins and MS samples}
+
+Lupine, like many DL models, learns in part by projecting observed inputs into a latent embedding space. We hypothesized that, if Lupine is learning effectively, then this embedding space should correspond to some aspect of biological signal rather than noise. We examined the latent embeddings of a Lupine model fit to the joint quantifications matrix by reducing the embedding dimensionality with UMAP and then coloring the 2D projection using various types of metadata. We found that Lupine's sample embeddings cluster exclusively by CPTAC cohort, with separate clusters for tumor and non-tumor samples (Figure \ref{fig:embeddings}). On the other hand, the protein embeddings do not form separate clusters but exhibit a clear gradation according to protein missingness fraction. Importantly, Lupine does not have access to any metadata; instead, these relationships are learned directly from the protein quantifications. We also investigated coloring the protein embeddings by various physicochemical properties such as size, charge, hydrophobicity, etc., but this analysis did not reveal any clear trends.
+
+Future work will continue to explore this learned embedding space. Several interesting questions may be addressed, including: Are there outlier patient samples that seem to cluster disconcordantly from their clinical annotations? What can we learn about the biology of such outliers? What are the additional properties that drive Lupine’s protein embeddings and what can they tell us about protein missingness?  
+
+\begin{figure}
+  \centering
+  \includegraphics[width=1.0\textwidth]{figures/lupine-embeddings.pdf}
+  \caption{{\bf UMAP projections of Lupine's sample and protein embeddings.} Left: points correspond to patient samples and are colored by CPTAC cohort. Center: points correspond to patient samples and are colored by sample type. Right: points correspond to proteins and are colored by protein missingness fraction in the joint quantifications matrix.}
+  \label{fig:embeddings}
+\end{figure} 
+
+\section{Discussion}
+
+Lupine is a proteomics imputation method that learns from multiple datasets at once. Lupine was trained on a joint protein quantifications matrix consisting of ten separate datasets for a total of 18,162 proteins across 1,755 MS samples. Our experiments demonstrate that Lupine performs better when trained on this joint quantifications matrix than on any of the ten individual datasets (Figure \ref{fig:mse-compare}C). We speculate that a Lupine model trained on an even larger training set will perform even better. Lupine is distinct among imputation methods in that it is designed to learn from many experiments; existing methods consider a single MS experiment at a time.
+
+It is worth noting, however, that here Lupine was trained on a rather homogenous joint quantifications matrix. All MS samples were derived from cancer patients, were run on Thermo Fisher instruments, and were processed with a common data analysis pipeline. In the future, Lupine will be fit to a more heterogenous training matrix that includes LFQ and data-independent acquisition (DIA) MS samples, as well as non-cancer samples. We speculate that given the model’s batch effect correction capacity (Figure \ref{fig:batch-effects}), Lupine will learn the differences between MS acquisition strategies and still emphasize biological signal. 
+
+% We explored using ESM2 \cite{esm2} protein embeddings to initialize our model's sample factors. 
+% Perhaps suprisingly, this did not speed up model training nor lead to better performance. 
+% It seems that even with random initializations the model is able to learn optimal embeddings given sufficient training epochs. 
+
+Lupine is a Python package available on GitHub (\url{https://github.com/Noble-Lab/lupine}) with an MIT open source license. The Lupine package includes a command that allows users to attach their own TMT MS samples to the existing joint quantifications matrix. Lupine may then be fit to the modified joint quantifications matrix and will impute the user’s TMT samples. Currently, model training requires a GPU, but we are working on a distilled model that can be run on CPU in a reasonable timeframe. Given the relationship between performance and the number of ensembled models (Supplementary Figure \ref{fig:sup-ensembling}), the Lupine package includes a parameter specifying the number of models to ensemble, with a default of 10. Additionally, the Lupine imputed CPTAC protein quantification matrices produced by this study are available on Zenodo (\url{https://zenodo.org/records/13146445}). We hope that the community continues to mine these imputed MS samples for insights into cancer biology. 
+
+% DreamAI may represent the upper limit of performance of existing, non-DL imputation models. 
+% The six individual methods that encompass DreamAI are so-called ``classic'' machine learning procedures, that is, they do not use DL. 
+% It is reasonable to assume that DreamAI maximizes the capabilities of classic machine learning procedures. 
+% It may be that the performance gains we observe with Lupine come from the fact that Lupine is a DL model capable of capturing complex and non-linear relationships between proteins and MS samples.
+
+Future versions of Lupine will incorporate patient-matched multi-omic measurements from CPTAC including phosphoproteomics, whole exome sequencing, transcriptomics and DNA methylation. Lupine’s imputation framework will be extended to encompass these other data modalities, allowing the model to learn a rich embedding space that captures DNA, RNA and protein measurements. Lupine’s embedding space will then be mined for insights into cancer biology. 
+
+Additionally, future versions of Lupine will be trained on peptide rather than protein quantifications. We initially trained Lupine on protein quantifications because the majority of MS experiments report protein-level identifications and quantifications. However, protein roll-up can mask important biological signal, for example, in the context of neurodegenerative diseases that are driven by aberrant proteoforms \cite{humpty-dumpty, smtg-maccoss}. Accordingly, future versions of Lupine will focus specifically on peptide imputation. 
+
+Finally, future work will focus on attaching statistical measures of confidence to imputed values. Because imputed values were not directly measured by the instrument, they should be thought of as lower quality measurements than observed values. However, most researchers do not take this into account when performing downstream analysis, and instead treat imputed and observed values the same. Prediction-powered inference (PPI) is a statistical framework for attaching confidence intervals to DL or machine learning predictions \cite{ppi-2023}. A powerful extension of this work is to build a PPI framework for Lupine imputation that allows researchers to prioritize higher confidence observed values in downstream analysis, while still benefiting from the increased statistical power and low-abundance quantifications afforded by imputation. 
+
+\section*{Data Availability}
+
+Unimputed CPTAC datasets were obtained from the Proteomics Data Commons web portal (\url{https://pdc.cancer.gov/pdc/cptac-pancancer}).
+The name of the file we accessed was Proteome\_UMich\_GENCODE34\_v1.zip.
+The Lupine imputed versions of these protein quantifications are available at \url{https://zenodo.org/records/13146445}.
+
+The code used to generate all the figures in this manuscript can be found at
+\url{https://github.com/Noble-Lab/2024_proteomics_impute}. 
+The python package implementing Lupine can be found at \url{https://github.com/Noble-Lab/lupine}. 
+
+\bibliographystyle{unsrt}
+\bibliography{references.bib} 
+
+\section*{Acknowledgments}
+
+The authors thank Michael J.\ MacCoss and Bo Wen from Genome Sciences for project guidance and help with all things related to CPTAC, respectively. 
+We thank Samuel H.\ Payne from Brigham Young University for pointing us to the relevant datasets and William E.\ Fondrie from Talus Bioscience for initial project guidance. 
+This work was supported by National Institute on Aging grant number 1F31AG082395-01 and by NSF award 2245300.
+
+\section*{Author contributions}
+Project was conceived of by W.S.N. Experiments were performed, text was written and figures were generated by L.H. 
+
+\section*{Author information}
+
+\textbf{Corresponding Author} \\
+William S.\ Noble, email: william-noble@uw.edu
+
+\textbf{ORCID} \\
+Lincoln Harris: 0000-0003-2544-4225 \\
+William S.\ Noble: 0000-0001-7283-4715
+
+\paragraph{Competing interests}
+The authors declare no competing financial interests.
+
+% \clearpage
+% % Enable supplementary figures and tables
+% \renewcommand{\figurename}{Supplementary Figure}
+% \renewcommand{\tablename}{Supplementary Table}
+% \setcounter{figure}{0}
+% \setcounter{table}{0}
+
+% \begin{figure}
+%   \centering
+%   \includegraphics[width=0.5\textwidth]{figures/partitions-w-batches.pdf}
+%   \caption{{\bf Lupine used a biased batch selection procedure during model training.} 
+%   The joint quantifications matrix (blue) was partitioned into training (orange) and test (green) sets with an MNAR procedure described in Section \ref{sec:partition}. Training batches were preferentially selected from the low-end of the training set distribution; repeated sampling of the training set was allowed.}
+%   \label{fig:sup-partition}
+% \end{figure} 
+
+% \begin{figure}
+%   \centering
+%   \includegraphics[width=0.5\textwidth]{figures/model-ensembling-test-errors.pdf}
+%   \caption{{\bf Test set MSE as a function of the number of ensembled Lupine models.} Lupine models were fit to the training set derived from the joint quantifications matrix. Four sets of ensembled models were fit to obtain the 95\% confidence intervals shown.}
+%   \label{fig:sup-ensembling}
+% \end{figure} 
+
+% \renewcommand{\arraystretch}{1.0}
+% \begin{table}
+%   \centering
+%   \begin{tabular}{lrr}
+%     \hline
+%     Cohort & Up-regulated & Down-regulated \\
+%     \hline
+%     CCRCC & 6 & 24 \\
+%     COAD & 2 & 7 \\
+%     HGSC & 1 & 7 \\
+%     HNSCC & 7 & 2 \\
+%     LSCC & 2 & 0 \\
+%     LUAD & 1 & 2 \\
+%     PDAC & 7 & 5 \\
+%     UCEC & 5 & 7 \\
+%     \hline
+%   \end{tabular}
+%   \caption{{\bf Counts of differentially expressed proteins uniquely identified after imputation with Lupine.} Differential expression testing was performed as described in Section \ref{sec:differential-expression} after imputation with Lupine, DreamAI or Gaussian random sampling. Numbers of DE proteins uniquely identified after Lupine imputation are indicated.}
+%   \label{tab:lupine-unique-DE}
+% \end{table}
+
+% \begin{figure}
+%   \centering
+%   \includegraphics[width=1.0\textwidth]{figures/lupine-DE-rankplots.pdf}
+%   \caption{{\bf Rank plots of mean intensities of differentially expressed proteins identified between tumor and non-tumor samples.} Blue indicates DE proteins identified after imputation with at least two of Lupine, DreamAI and Gaussian random sampling. Orange indicates DE proteins uniquely identified after Lupine imputation. The mean protein intensities for non-tumor samples are shown. Proteins with $>$90\% initial missingness were excluded from this analysis.}
+%   \label{fig:lupine-unique-DE-intensities}
+% \end{figure} 
+
+% \begin{figure}
+%   \centering
+%   \includegraphics[width=1.0\textwidth]{figures/batch-effects-three-cohorts.pdf}
+%   \caption{{\bf UMAP projections of protein intensities following imputation for three additional CPTAC cohorts.} 
+%   Left panel: Lupine imputation colored by sample type; center panel: column min imputation colored by sample type; right panel: column min imputation colored by TMT batch ID.}
+%   \label{fig:sup-batch-effects}
+% \end{figure} 
+
+% \begin{figure}
+%   \centering
+%   \includegraphics[width=1.0\textwidth]{figures/global-umaps.pdf}
+%   \caption{{\bf UMAP projections of the Lupine imputed joint quantifications matrix.}
+%   Left: colored by CPTAC cohort; center: colored by sample type; right: colored by TMT batch ID. Each point corresponds to an MS sample.}
+%   \label{fig:sup-global-umap}
+% \end{figure} 
+
+\end{document}
